@@ -23,7 +23,7 @@ float angle0 = 0.00; // 机械平衡角补偿；目标俯仰角 = -angle0（度�
 // 直立误差：angle+angle0（度）；D 使用校正后的 gyroX（度/秒）。
 double kp = 20.0, ki = 0, kd = 1.0;
 // 速度误差：setp0 - 滤波后的两轮总计数（每 40 ms 的计数，保持原有单位）。
-double kp_speed = 2.0, ki_speed = 0, kd_speed = 0;
+double kp_speed = 3.0, ki_speed = 0.1, kd_speed = 0;
 // 转向改为角速度 PID：误差=目标角速度-实测角速度；D 作用于角加速度。
 // 与课程原 turnspin 中 kd_turn 直接乘角速度的含义不同。
 double kp_turn = 0, ki_turn = 0, kd_turn = 0;
