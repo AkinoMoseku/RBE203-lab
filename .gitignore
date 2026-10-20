@@ -1,0 +1,25 @@
+# Local build output, serial logs, and temporary analysis files.
+/tmp/
+/build/
+*.o
+*.a
+*.elf
+*.hex
+*.eep
+*.bin
+*.d
+*.cache
+
+# Local editor and operating-system files.
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
