@@ -8,6 +8,7 @@
 #include <util/atomic.h>
 #include "gyro_correction.h"
 #include "pid_controller.h"
+#include "bluetooth_joystick.h"
 
 MPU6050 mpu;
 BalanceCar balancecar;
@@ -23,12 +24,17 @@ float angle0 = 0.00; // 机械平衡角补偿；目标俯仰角 = -angle0（度�
 // 直立误差：angle+angle0（度）；D 使用校正后的 gyroX（度/秒）。
 double kp = 20.0, ki = 0, kd = 1.0;
 // 速度误差：setp0 - 滤波后的两轮总计数（每 40 ms 的计数，保持原有单位）。
-double kp_speed = 3.0, ki_speed = 0.1, kd_speed = 0;
+double kp_speed = 2.0, ki_speed = 0.05, kd_speed = 0;
 // 转向改为角速度 PID：误差=目标角速度-实测角速度；D 作用于角加速度。
 // 与课程原 turnspin 中 kd_turn 直接乘角速度的含义不同。
-double kp_turn = 0, ki_turn = 0, kd_turn = 0;
+double kp_turn = 0.0, ki_turn = 0, kd_turn = 0;
 double setp0 = 0, dpwm = 0, dl = 0;
 const float yawRateTarget = 0.0f; // 度/秒；零表示抑制自转，不是保持绝对航向。
+// HC-06 使用课程板的硬件串口 Serial (Uno D0/RX、D1/TX)，9600 8N1。
+// 协议沿用教程 [joystick,LH,LV,RH,RV]；这里只用 LV 改速度目标。
+// 本车速度单位是两轮总计数/40ms；教程的 LV/25 转/秒不可直接照搬。
+const float JOYSTICK_MAX_SPEED = 300.0f; // 满杆目标 ±15 计数/40ms，可按实测调整。
+const int8_t JOYSTICK_SPEED_SIGN = 1;   // 如前后方向相反改为 -1；不改电机极性。
 float K1 = 0.05;
 float Q_angle = 0.001, Q_gyro = 0.005;
 float R_angle = 0.5, C_0 = 1;
@@ -45,7 +51,7 @@ float dt = timeChange * 0.001;
 #define PinA_left 2
 #define PinA_right 4
 
-// 无串口/蓝牙运动命令；传给课程库的运动目标始终为零。
+// 只改速度 PID 目标；课程库的开环运动/差速标志仍为零。
 const int front = 0, back = 0, turnl = 0, turnr = 0, spinl = 0, spinr = 0;
 int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
 volatile long count_left = 0, count_right = 0;
@@ -55,6 +61,11 @@ double Outputs = 0;
 float turnoutput = 0;
 PidController anglePid, speedPid, yawPid;
 float speedFiltered = 0, yawRate = 0;
+JoystickFrameParser joystickParser;
+JoystickSpeedCommand joystickCommand;
+volatile uint32_t joystickPackets = 0;
+volatile uint8_t joystickEpoch = 0;
+volatile bool joystickFlushRx = true;
 
 volatile bool imuOk = false;
 bool filterSeeded = false;
@@ -70,6 +81,10 @@ struct DebugSnapshot
   unsigned long ms, cycles, periodUs, durationUs, errors;
   float angle, side, gyroX, speed, yaw;
   float angleIntegral, speedIntegral, yawIntegral;
+  float speedTarget;
+  uint32_t joystickCount;
+  int8_t joystickLv;
+  uint8_t joystickState;
   double pwmLeft, pwmRight, balanceOutput, speedOutput, rotation;
   int encLeft, encRight;
   int16_t accX, accY, accZ, rawGx, rawGy, rawGz;
@@ -81,11 +96,11 @@ void printRobotDebug()
 {
   static unsigned long lastReportMs = 0;
   static DebugSnapshot sample;
-  static byte part = 10;
-  // 9600 baud 下每条约 330 字节。分段发送，避免占满 TX 后阻塞。
+  static byte part = 11;
+  // 9600 baud 下每条约 360 字节。分段发送，避免占满 TX 后阻塞。
   // 只在 loop 中打印，5 ms 控制中断不进行串口输出。
   if (Serial.availableForWrite() < 60) return;
-  if (part == 10)
+  if (part == 11)
   {
     const unsigned long now = millis();
     if (now - lastReportMs < 500) return;
@@ -105,6 +120,10 @@ void printRobotDebug()
       sample.angleIntegral = anglePid.iTerm;
       sample.speedIntegral = speedPid.iTerm;
       sample.yawIntegral = yawPid.iTerm;
+      sample.speedTarget = setp0;
+      sample.joystickCount = joystickPackets;
+      sample.joystickLv = joystickCommand.lv();
+      sample.joystickState = joystickCommand.state();
       sample.pwmLeft = balancecar.pwm1;
       sample.pwmRight = balancecar.pwm2;
       sample.balanceOutput = balancecar.angleoutput;
@@ -179,8 +198,13 @@ void printRobotDebug()
       break;
     case 9:
       Serial.print(F(" v=")); Serial.print(sample.speed, 1);
-      Serial.print(F(" vref=")); Serial.print(setp0, 1);
-      Serial.print(F(" wref=")); Serial.println(yawRateTarget, 1);
+      Serial.print(F(" vref=")); Serial.print(sample.speedTarget, 2);
+      Serial.print(F(" wref=")); Serial.print(yawRateTarget, 1);
+      break;
+    case 10:
+      Serial.print(F(" bt=")); Serial.print(sample.joystickState);
+      Serial.print(F(" LV=")); Serial.print((int)sample.joystickLv);
+      Serial.print(F(" rx=")); Serial.println(sample.joystickCount);
       break;
   }
   ++part;
@@ -237,6 +261,57 @@ void finishControlCycle(unsigned long started)
 {
   debugDurationUs = micros() - started;
   ++debugCycles;
+}
+
+void pollBluetoothJoystick()
+{
+  static bool draining = true;
+  static uint8_t frameEpoch = 0;
+  bool flush = false;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+  {
+    flush = joystickFlushRx;
+    joystickFlushRx = false;
+  }
+  if (flush)
+  {
+    joystickParser.reset();
+    draining = true;
+  }
+  // 每次 loop 最多处理 16 字节，避免异常输入阻塞控制/日志。
+  for (byte i = 0; i < 16 && Serial.available() > 0; ++i)
+  {
+    const char value = (char)Serial.read();
+    if (draining) continue;
+    if (value == '[') frameEpoch = joystickEpoch;
+    JoystickFrame frame;
+    const uint32_t now = millis();
+    if (joystickParser.feed(value, now, frame))
+    {
+      ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+      {
+        // 保护或超时可能在解析过程中发生；旧会话的数据不能重新使目标生效。
+        if (frameEpoch == joystickEpoch && !joystickFlushRx)
+        {
+          ++joystickPackets;
+          joystickCommand.receive(frame.lv, now);
+        }
+      }
+    }
+  }
+  if (draining && Serial.available() == 0) draining = false;
+}
+
+void refreshJoystickTarget(bool blocked)
+{
+  if (joystickCommand.tick(millis(), blocked))
+  {
+    ++joystickEpoch;
+    joystickFlushRx = true;
+  }
+  // 无帧/超过500ms/保护时目标归零；恢复通信后必须先回中。
+  // 只清行驶目标，电机仍执行平衡控制。
+  setp0 = joystickCommand.target(JOYSTICK_MAX_SPEED, JOYSTICK_SPEED_SIGN);
 }
 
 void resetPidControllers()
@@ -317,6 +392,7 @@ void inter()
     resetPidControllers(); // 恢复时不继承故障前积分/微分状态。
     filterSeeded = false;
     debugStopFlags = 4;
+    refreshJoystickTarget(true);
     finishControlCycle(started);
     return; // STBY 仍为 HIGH，日志持续输出；无有效传感器样本时 PWM 为零。
   }
@@ -341,6 +417,7 @@ void inter()
       (balancecar.stopl + balancecar.stopr > 1500 ||
        balancecar.stopl + balancecar.stopr < -1500))
     debugStopFlags |= 2;
+  refreshJoystickTarget(debugStopFlags != 0);
   if (debugStopFlags != 0)
     resetPidControllers();
   else
@@ -373,10 +450,12 @@ void setup()
   Wire.begin();
   Wire.setWireTimeout(10000, true);
   mpu.initialize();
-  Serial.println(F("ROBOT_SERIAL_DEBUG v5.0-three-pid baud=9600"));
+  Serial.println(F("ROBOT_SERIAL_DEBUG v6.0-hc06-joystick baud=9600"));
   Serial.print(F("IMU_CONNECTION="));
   Serial.println(mpu.testConnection() ? F("OK") : F("FAIL"));
-  Serial.println(F("AUTO balance; STBY=1; no serial commands; DBG every 500ms."));
+  Serial.println(F("AUTO balance; STBY=1; DBG every 500ms."));
+  Serial.println(F("RX [joystick,LH,LV,RH,RV]; LV=-100..100; center first."));
+  Serial.println(F("bt: 0=no link 1=active 2=center required 3=protection; timeout=500ms."));
   Serial.println(F("gyroX=corrected deg/s; graw=raw x,y,z; target=-angle0."));
   Serial.println(F("PID: B=angle V=speed Y=yaw-rate; I=B,V,Y contributions."));
   Serial.println(F("v/vref=counts/40ms; yawRate/wref=deg/s; PID I/D use seconds."));
@@ -391,5 +470,6 @@ void setup()
 
 void loop()
 {
-  printRobotDebug(); // 串口只输出；任何输入都不执行命令。
+  pollBluetoothJoystick();
+  printRobotDebug();
 }
